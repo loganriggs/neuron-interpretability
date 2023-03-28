@@ -1,14 +1,20 @@
 import torch as th
 from circuitsvis.activations import text_neuron_activations
-
+from jaxtyping import Float, Int
+from transformer_lens.hook_points import (
+    HookedRootModule,
+    HookPoint,
+)
+from einops import rearrange
 class NeuronTextSimplifier:
     def __init__(self, model, layer: int, neuron: int) -> None:
         self.model = model
+        self.device = model.cfg.device
         self.layer = layer
         self.neuron = neuron
         self.model.requires_grad_(False)
         self.embed_weights = list(list(model.children())[0].parameters())[0]
-        if("gpt" in model.cfg.model_name):
+        if("pythia" not in model.cfg.model_name):
             transformer_block_loc = 4
         else:
             transformer_block_loc = 2
@@ -21,11 +27,80 @@ class NeuronTextSimplifier:
         self._neurons = th.empty(0)
         def hook(model, input, output):
             self._neurons = output
-        self.model.blocks[self.layer].mlp.hook_pre.register_forward_hook(hook)
+        self.model.blocks[self.layer].mlp.hook_post.register_forward_hook(hook)
+
+    def ablate_mlp_neurons(self, tokens, neurons: th.Tensor):
+        def mlp_ablation_hook(
+            value: Float[th.Tensor, "batch pos d_mlp"],
+            hook: HookPoint
+        ) -> Float[th.Tensor, "batch pos d_mlp"]:
+            if(neurons.shape[0] == 0):
+                return value
+            value[:, :, neurons] = 0
+            return value
+        return self.model.run_with_hooks(tokens, fwd_hooks=[(f"blocks.{self.layer}.mlp.hook_post", mlp_ablation_hook)])
+        
+    def add_noise_to_text(self, text, noise_level=1.0):
+        if isinstance(text, str):
+            text = [text]
+        text_list = []
+        activation_list = []
+        for t in text:
+            split_text = self.model.to_str_tokens(t, prepend_bos=False)
+            tokens = self.model.to_tokens(t, prepend_bos=False)
+            # Add gaussian noise to the input of each word in turn, getting the diff in final neuron's response
+            embedded_tokens = self.model.embed(tokens)
+            batch_size, seq_size, embedding_size = embedded_tokens.shape
+            noise = th.randn(1, embedding_size, device=self.device)*noise_level
+            original = self.embedded_forward(embedded_tokens)[:,-1,self.neuron]
+            changed_activations = th.zeros(seq_size, device=self.device)
+            for i in range(seq_size):
+                embedded_tokens[:,i,:] += noise
+                neuron_response = self.embedded_forward(embedded_tokens)
+                changed_activations[i] = neuron_response[:,-1,self.neuron].item()
+                embedded_tokens[:,i,:] -= noise
+            changed_activations -= original
+            text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+            activation_list += changed_activations.tolist() + [0.0]
+        activation_list = th.tensor(activation_list).reshape(-1,1,1)
+        return text_neuron_activations(tokens=text_list, activations=activation_list)
+
+    def visualize_logit_diff(self, text, neurons: th.Tensor, setting="true_tokens", verbose=True):
+        if isinstance(text, str):
+            text = [text]
+        text_list = []
+        logit_list = []
+        for t in text:
+            split_text = self.model.to_str_tokens(t, prepend_bos=False)
+            tokens = self.model.to_tokens(t, prepend_bos=False)
+            original_logits = self.model(tokens).log_softmax(-1)
+            ablated_logits = self.ablate_mlp_neurons(tokens, neurons).log_softmax(-1)
+            diff_logits =  ablated_logits - original_logits
+            if setting == "true_tokens":
+                # Gather the logits for the true tokens
+                diff = rearrange(diff_logits.gather(2,tokens.unsqueeze(2)), "b s n -> (b s n)")
+            elif setting == "max":
+                val, ind = diff_logits.max(2)
+                diff = rearrange(val, "b s -> (b s)")
+                split_text = self.model.to_str_tokens(ind)
+                tokens = ind
+            if(verbose):
+                text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+                text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+                orig = rearrange(original_logits.gather(2,tokens.unsqueeze(2)), "b s n -> (b s n)")
+                ablated = rearrange(ablated_logits.gather(2,tokens.unsqueeze(2)), "b s n -> (b s n)")
+                logit_list += orig.tolist() + [0.0]
+                logit_list += ablated.tolist() + [0.0]
+            text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+            logit_list += diff.tolist() + [0.0]
+        logit_list = th.tensor(logit_list).reshape(-1,1,1)
+        if verbose:
+            print(f"Max & Min logit-diff: {logit_list.max().item():.2f} & {logit_list.min().item():.2f}")
+        return text_neuron_activations(tokens=text_list, activations=logit_list)
 
     def get_neuron_activation(self, tokens):
-        _, cache = self.model.run_with_cache(tokens)
-        return cache[f"blocks.{self.layer}.mlp.hook_pre"][0,:,self.neuron].tolist()
+        _, cache = self.model.run_with_cache(tokens.to(self.model.cfg.device))
+        return cache[f"blocks.{self.layer}.mlp.hook_post"][0,:,self.neuron].tolist()
 
     def text_to_activations_print(self, text):
         token = self.model.to_tokens(text, prepend_bos=False)
@@ -41,23 +116,39 @@ class NeuronTextSimplifier:
         return "".join(res)
 
     def text_to_visualize(self, text):
-        if isinstance(text, list):
-            text_list = []
-            act_list = []
-            for t in text:
+        if isinstance(text, str):
+            text = [text]
+        text_list = []
+        act_list = []
+        for t in text:
+            if isinstance(t, str): # If the text is a list of tokens
                 split_text = self.model.to_str_tokens(t, prepend_bos=False)
                 token = self.model.to_tokens(t, prepend_bos=False)
-                text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
-                act_list+= self.get_neuron_activation(token) + [0.0]
-            act_list = th.tensor(act_list).reshape(-1,1,1)
-            return text_neuron_activations(tokens=text_list, activations=act_list)
-        elif isinstance(text, str):
-            split_text = self.model.to_str_tokens(text, prepend_bos=False)
-            token = self.model.to_tokens(text, prepend_bos=False)
-            act = th.tensor(self.get_neuron_activation(token)).reshape(-1,1,1)
-            return text_neuron_activations(tokens=split_text, activations=act)
-        else:
-            raise TypeError("text must be of type str or list, not {type(text)}")
+            else:
+                token = t
+                split_text = self.model.to_str_tokens(t, prepend_bos=False)
+            text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+            act_list+= self.get_neuron_activation(token) + [0.0]
+        act_list = th.tensor(act_list).reshape(-1,1,1)
+        return text_neuron_activations(tokens=text_list, activations=act_list)
+        # if isinstance(text, list):
+        #     text_list = []
+        #     act_list = []
+        #     for t in text:
+        #         split_text = self.model.to_str_tokens(t, prepend_bos=False)
+        #         token = self.model.to_tokens(t, prepend_bos=False)
+        #         text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+        #         act_list+= self.get_neuron_activation(token) + [0.0]
+        #     act_list = th.tensor(act_list).reshape(-1,1,1)
+        #     return text_neuron_activations(tokens=text_list, activations=act_list)
+        # elif isinstance(text, str):
+        #     split_text = self.model.to_str_tokens(text, prepend_bos=False)
+        #     token = self.model.to_tokens(text, prepend_bos=False)
+        #     act = th.tensor(self.get_neuron_activation(token)).reshape(-1,1,1)
+        #     return text_neuron_activations(tokens=split_text, activations=act)
+        # else:
+        #     raise TypeError("text must be of type str or list, not {type(text)}")
+        
     
     def get_text_and_activations_iteratively(self, text):
         tokens = self.model.to_tokens(text, prepend_bos=False)[0]
@@ -149,7 +240,7 @@ class NeuronTextSimplifier:
         if init_text is not None:
             init_tokens = self.model.to_tokens(init_text, prepend_bos=False)
             seq_size = init_tokens.shape[-1]
-        diverse_outputs = th.zeros(diverse_outputs_num, seq_size, embed_size)
+        diverse_outputs = th.zeros(diverse_outputs_num, seq_size, embed_size).to(self.device)
         for d_ind in range(diverse_outputs_num):
             print(f"Starting diverse output {d_ind}")
             if init_text is None:
@@ -157,7 +248,7 @@ class NeuronTextSimplifier:
                 init_tokens = th.randint(0, vocab_size, (1,seq_size))
                 init_text = self.model.to_string(init_tokens)
             prompt_embeds = th.nn.Parameter(self.model.embed(init_tokens)).detach()
-            prompt_embeds.requires_grad_(True)
+            prompt_embeds.requires_grad_(True).to(self.device)
 
             optim = th.optim.AdamW([prompt_embeds], lr=.8, weight_decay=0.01)
             largest_activation = 0
