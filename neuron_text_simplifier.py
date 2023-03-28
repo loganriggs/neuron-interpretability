@@ -46,8 +46,12 @@ class NeuronTextSimplifier:
         text_list = []
         activation_list = []
         for t in text:
-            split_text = self.model.to_str_tokens(t, prepend_bos=False)
-            tokens = self.model.to_tokens(t, prepend_bos=False)
+            if isinstance(t, str): # If the text is a list of tokens
+                split_text = self.model.to_str_tokens(t, prepend_bos=False)
+                tokens = self.model.to_tokens(t, prepend_bos=False)
+            else: # t equals tokens
+                tokens = t
+                split_text = self.model.to_str_tokens(t, prepend_bos=False)
             # Add gaussian noise to the input of each word in turn, getting the diff in final neuron's response
             embedded_tokens = self.model.embed(tokens)
             batch_size, seq_size, embedding_size = embedded_tokens.shape
@@ -98,9 +102,12 @@ class NeuronTextSimplifier:
             print(f"Max & Min logit-diff: {logit_list.max().item():.2f} & {logit_list.min().item():.2f}")
         return text_neuron_activations(tokens=text_list, activations=logit_list)
 
-    def get_neuron_activation(self, tokens):
+    def get_neuron_activation(self, tokens, neuron: int = None):
         _, cache = self.model.run_with_cache(tokens.to(self.model.cfg.device))
-        return cache[f"blocks.{self.layer}.mlp.hook_post"][0,:,self.neuron].tolist()
+        if neuron:
+            return cache[f"blocks.{self.layer}.mlp.hook_post"][0,:,neuron].tolist()
+        else:
+            return cache[f"blocks.{self.layer}.mlp.hook_post"][0,:,self.neuron].tolist()
 
     def text_to_activations_print(self, text):
         token = self.model.to_tokens(text, prepend_bos=False)
@@ -115,7 +122,9 @@ class NeuronTextSimplifier:
         res[1::2] = act
         return "".join(res)
 
-    def text_to_visualize(self, text):
+    def text_to_visualize(self, text, neuron_list: list = None):
+        if not neuron_list:
+            neuron_list = [self.neuron]
         if isinstance(text, str):
             text = [text]
         text_list = []
@@ -124,11 +133,12 @@ class NeuronTextSimplifier:
             if isinstance(t, str): # If the text is a list of tokens
                 split_text = self.model.to_str_tokens(t, prepend_bos=False)
                 token = self.model.to_tokens(t, prepend_bos=False)
-            else:
+            else: # t are tokens
                 token = t
                 split_text = self.model.to_str_tokens(t, prepend_bos=False)
-            text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
-            act_list+= self.get_neuron_activation(token) + [0.0]
+            for neuron in neuron_list:
+                text_list += [x.replace('\n', '\\newline') for x in split_text] + ["\n"]
+                act_list+= self.get_neuron_activation(token, neuron) + [0.0]
         act_list = th.tensor(act_list).reshape(-1,1,1)
         return text_neuron_activations(tokens=text_list, activations=act_list)
         # if isinstance(text, list):
